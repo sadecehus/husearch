@@ -1,0 +1,11 @@
+# husearch tarama çıktıları
+husearch-results/
+*.nmap
+*.xml
+*.json
+*.ai.md
+
+# editör / sistem
+*.swp
+*~
+.DS_Store

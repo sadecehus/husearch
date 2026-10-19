@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+# husearch v2.1 - servis farkindaligi olan moduler pentest kesif araci
+#
+# Ozellikler:
+#   - Tarama profilleri: quick (hizli) / full (varsayilan) / deep (vuln scriptleri + UDP)
+#   - Akıllı servis analizi: SMB, HTTP, FTP, SSH, Redis, SNMP, MySQL... servisine ozel
+#     oneriler + versiyon bazli zafiyet ihbarlari
+#   - Guvenli enum kontrolleri: null session, anonymous FTP, HTTP banner/robots,
+#     Redis INFO, SNMP public string testleri (flagsiz calisinca otomatik; --ask ile onayli)
+#   - AI pentester analizi: ANTHROPIC_API_KEY tanimliysa bulgulari Claude'a gonderip
+#     uzman yorumu + oncelikli saldiri yolu + bilinen zafiyet/CVE degerlendirmesi uretir
+#   - JSON cikti (nmap XML uzerinden programatik isleme)
+#   - Onceki tarama ile karsilastirma (yeni/kapanan port, servis degisikligi)
+#   - Rustscan retry + nmap fallback (paket kaybi olan baglantilarda dayaniklilik)
+#
+# Kullanim: husearch <ip> [secenekler] [ekstra nmap argumanlari]
+# Ornek:    husearch 10.10.10.5
+#           husearch 10.10.10.5 -p deep
+#           husearch 10.10.10.5 -p quick --script vuln -T5
+#
+# Sonuclar: ~/husearch-results/<ip>_<zaman>.{nmap,xml,json}
+
+set -u
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+[ -t 1 ] || { RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''; }
+
+info()  { echo -e "${CYAN}[*]${NC} $1"; }
+good()  { echo -e "${GREEN}[+]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+err()   { echo -e "${RED}[x]${NC} $1"; }
+
+usage() {
+    cat <<EOF
+husearch v2.1 - moduler pentest kesif araci (rustscan + nmap + akıllı analiz + AI)
+
+Kullanim: husearch <ip> [secenekler] [ekstra nmap argumanlari]
+
+Flagsiz "husearch <ip>" = yardimci pentester modu:
+  full profil + otomatik guvenli enum + (API key varsa) AI analizi.
+
+Secenekler:
+  -p quick|full|deep   tarama profili (varsayilan: full)
+                       quick: 1-1000 port, sadece -sV (hizli)
+                       full : tum portlar 0-65535, -sV -sC
+                       deep : full + --script vuln + UDP top-30 (root gerekir)
+  -u, --udp            UDP top-30 taramasi ekle (deep zaten icerir)
+  --ask                enum kontrollerinden once onay sor (varsayilan: otomatik)
+  --no-enum            enum kontrollerini atla (sadece oneri goster)
+  --no-ai              AI pentester analizini atla
+  --no-json            JSON cikti uretme
+  --no-diff            onceki tarama ile karsilastirmayi atla
+  -h, --help           bu yardim
+
+Ortam degiskenleri (AI analizi icin):
+  ANTHROPIC_API_KEY    tanimliysa AI analizi devreye girer (yoksa AI atlanir)
+  HUSEARCH_MODEL       kullanilacak model (varsayilan: claude-opus-4-8)
+  HUSEARCH_EFFORT      low|medium|high|xhigh|max (varsayilan: medium)
+
+Ornekler:
+  husearch 10.10.10.5
+  husearch 10.10.10.5 -p deep
+  husearch 10.10.10.5 -p quick --script vuln -T5
+
+Sonuclar: ~/husearch-results/<ip>_<zaman>.{nmap,xml,json,ai.md}
+EOF
+    exit "${1:-0}"
+}
+
+# ---------------- arguman ayristirma ----------------
+
+PROFILE="full"
+DO_UDP=0
+ENUM_MODE="auto"   # ask | auto | off  (flagsiz varsayilan: auto = yardimci pentester modu)
+DO_JSON=1
+DO_DIFF=1
+DO_AI=1
+IP=""
+EXTRA_ARGS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p|--profile)
+            [ $# -ge 2 ] || { err "-p bir profil degeri ister (quick|full|deep)"; usage 1; }
+            case "$2" in
+                quick|full|deep) PROFILE="$2" ;;
+                *) err "gecersiz profil: $2 (quick|full|deep)"; usage 1 ;;
+            esac
+            shift 2 ;;
+        -u|--udp)     DO_UDP=1; shift ;;
+        --ask)        ENUM_MODE="ask"; shift ;;
+        --auto)       ENUM_MODE="auto"; shift ;;
+        --no-enum)    ENUM_MODE="off"; shift ;;
+        --no-ai)      DO_AI=0; shift ;;
+        --no-json)    DO_JSON=0; shift ;;
+        --no-diff)    DO_DIFF=0; shift ;;
+        -h|--help)    usage 0 ;;
+        *)
+            if [ -z "$IP" ]; then IP="$1"; else EXTRA_ARGS+=("$1"); fi
+            shift ;;
+    esac
+done
+
+[ -n "$IP" ] || usage 1
+[[ "$IP" =~ ^[0-9a-zA-Z._-]+$ ]] || { err "gecersiz hedef: $IP"; exit 1; }
+
+[ "$PROFILE" = "deep" ] && DO_UDP=1
+
+# ---------------- bagimliliklar ----------------
+
+for dep in rustscan nmap python3; do
+    command -v "$dep" &>/dev/null || { err "$dep bulunamadi! Kur: sudo apt install -y $dep"; exit 1; }
+done
+
+if [ "$DO_UDP" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    warn "UDP taramasi root gerektirir - UDP kisimi atlandi (sudo ile calistir)"
+    DO_UDP=0
+fi
+
+# ---------------- dosyalar ----------------
+
+OUTDIR="$HOME/husearch-results"
+mkdir -p "$OUTDIR"
+STAMP=$(date +%Y%m%d_%H%M%S)
+BASE="$OUTDIR/${IP}_${STAMP}"
+OUTNMAP="$BASE.nmap"; OUTXML="$BASE.xml"
+UDPNMAP="$BASE.udp.nmap"; UDPXML="$BASE.udp.xml"
+OUTJSON="$BASE.json"
+
+TMPD=$(mktemp -d)
+FINDFILE="$TMPD/findings.txt"
+SUGGFILE="$TMPD/suggestions.txt"
+DIFFFILE="$TMPD/diff.txt"
+: > "$FINDFILE"; : > "$SUGGFILE"; : > "$DIFFFILE"
+trap 'rm -rf "$TMPD"' EXIT
+
+finding() { echo -e "  ${RED}[BULGU]${NC} $1"; echo "$1" >> "$FINDFILE"; }
+suggest() { echo -e "  ${CYAN}[oneri]${NC} $1"; echo "$1" >> "$SUGGFILE"; }
+
+ask_enum() {
+    [ "$ENUM_MODE" = "off" ] && return 1
+    [ "$ENUM_MODE" = "auto" ] && return 0
+    if [ ! -r /dev/tty ]; then
+        info "(etkilesimli terminal yok - enum atlandi: $1)"
+        return 1
+    fi
+    local ans=""
+    printf '%b' "${YELLOW}[?]${NC} $1 [y/N] " > /dev/tty
+    IFS= read -r -t 30 ans < /dev/tty || ans=""
+    [[ "$ans" =~ ^[YyEe]$ ]]
+}
+
+echo -e "${CYAN}"
+echo "=============================================="
+echo "   husearch v2.1 - $IP"
+echo "   profil: $PROFILE | $(date '+%d.%m.%Y %H:%M:%S')"
+echo "=============================================="
+echo -e "${NC}"
+
+# ---------------- 1. asama: port kesfi (rustscan + retry + fallback) ----------------
+
+scan_ports() {
+    local range="$1" raw ports attempt
+    for attempt in 1 2; do
+        [ "$attempt" -gt 1 ] && { warn "rustscan sonuc vermedi, deneme 2/2..."; sleep 2; }
+        raw=$(rustscan -a "$IP" -r "$range" --no-banner -g -b 2500 --tries 2 -t 2000 2>/dev/null)
+        ports=$(echo "$raw" | grep -oP '\[\K[0-9,]+(?=\])' | head -1)
+        [ -z "$ports" ] && ports=$(echo "$raw" | grep -oP '(?<=:)[0-9]+' | sort -n -u | paste -sd, -)
+        [ -n "$ports" ] && { echo "$ports"; return 0; }
+    done
+    return 1
+}
+
+RANGE="0-65535"
+[ "$PROFILE" = "quick" ] && RANGE="1-1000"
+
+info "rustscan baslatiliyor: $IP ($RANGE)..."
+if ! PORTS=$(scan_ports "$RANGE"); then
+    warn "rustscan 2 denemede sonuc vermedi - nmap -p- fallback deneniyor..."
+    PORTS=$(nmap -Pn -p- --min-rate 5000 --open -T4 "$IP" 2>/dev/null | grep -oP '^[0-9]+(?=/)' | paste -sd, -)
+    if [ -z "$PORTS" ]; then
+        err "Acik port bulunamadi ya da host ulasilamadi."
+        exit 2
+    fi
+    good "nmap fallback ile acik portlar bulundu"
+fi
+
+NPORTS=$(echo "$PORTS" | tr ',' '\n' | wc -l)
+good "$NPORTS adet acik port bulundu: $PORTS"
+
+# ---------------- 2. asama: nmap servis taramasi ----------------
+
+case "$PROFILE" in
+    quick) NMAP_BASE=(-Pn -sV -T4 --version-light) ;;
+    full)  NMAP_BASE=(-Pn -sV -sC -T4) ;;
+    deep)  NMAP_BASE=(-Pn -sV -sC -T4 --script vuln) ;;
+esac
+
+[ "$PROFILE" = "deep" ] && warn "deep profili --script vuln icerir, uzun surebilir..."
+
+info "nmap baslatiliyor (profil: $PROFILE)... Sonuc: $OUTNMAP"
+echo
+nmap "${NMAP_BASE[@]}" -p "$PORTS" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IP" -oN "$OUTNMAP" -oX "$OUTXML"
+RC=$?
+echo
+
+# ---------------- 3. asama: UDP (opsiyonel) ----------------
+
+if [ "$DO_UDP" -eq 1 ]; then
+    info "UDP taramasi (top-30)..."
+    nmap -sU --top-ports 30 --open -Pn -T4 "$IP" -oN "$UDPNMAP" -oX "$UDPXML" >/dev/null 2>&1
+    NUUDP=$(grep -cE '^[0-9]+/udp +open' "$UDPNMAP" 2>/dev/null || true)
+    if [ "${NUUDP:-0}" -gt 0 ]; then
+        good "UDP: $NUUDP acik port bulundu"
+    else
+        info "UDP: acik port bulunamadi"
+    fi
+fi
+
+NMAPFILES=("$OUTNMAP")
+[ -f "$UDPNMAP" ] && NMAPFILES+=("$UDPNMAP")
+
+# ---------------- 4. asama: akıllı analiz ----------------
+
+emit_ports() {
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        awk '
+            /^PORT +STATE/ { p=1; next }
+            p && $1 ~ /^[0-9]+\/(tcp|udp)$/ {
+                pp=$1; st=$2; svc=$3; $1=""; $2=""; $3=""; sub(/^ +/, "")
+                print pp "|" st "|" svc "|" $0
+                next
+            }
+            p && /^$/ { p=0 }
+        ' "$f"
+    done
+}
+
+version_hints() {
+    local v="$1" re
+    re='vsftpd.*2\.3\.4'
+    [[ "$v" =~ $re ]] && finding "vsftpd 2.3.4 - arka kapi surumu (CVE-2011-2523)"
+    re='ProFTPD.*1\.3\.5'
+    [[ "$v" =~ $re ]] && finding "ProFTPD 1.3.5 - mod_copy ile RCE (CVE-2015-3306)"
+    re='Apache httpd 2\.4\.(49|50)'
+    [[ "$v" =~ $re ]] && finding "Apache 2.4.49/2.4.50 - path traversal + RCE (CVE-2021-41773 / CVE-2021-42013)"
+    re='Apache httpd 2\.2\.'
+    [[ "$v" =~ $re ]] && warn "Apache 2.2 - EOL surum, bilinen cok zafiyet var"
+    re='Apache Tomcat'
+    [[ "$v" =~ $re ]] && suggest "Tomcat: /manager default cred denemesi (tomcat:s3cret) + searchsploit tomcat"
+    re='OpenSSH_([0-6]\.|7\.[0-7](\D|$))'
+    [[ "$v" =~ $re ]] && finding "Eski OpenSSH (<7.8) - kullanici enum (CVE-2018-15473)"
+    re='OpenSSH_(7\.[2-9]|8\.|9\.[0-7](\D|$))'
+    [[ "$v" =~ $re ]] && warn "OpenSSH 7.1-9.7 araligi - regreSSHion kontrolu (CVE-2024-6387)"
+    re='libssh.*0\.(6|7|8\.[0-2])(\D|$)'
+    [[ "$v" =~ $re ]] && finding "libssh - kimlik dogrulama bypass (CVE-2018-10933)"
+    re='Microsoft IIS httpd 6\.0'
+    [[ "$v" =~ $re ]] && suggest "IIS 6.0 - WebDAV PUT / asp yukleme (davtest dene)"
+    re='Drupal ?[0-7]\.'
+    [[ "$v" =~ $re ]] && finding "Drupal 7.x - Drupalgeddon (CVE-2018-7600) kontrolu"
+    re='Exim 4\.(8[0-4])'
+    [[ "$v" =~ $re ]] && finding "Exim - LPE/RCE kontrolu (CVE-2023-51764)"
+    re='Webmin|MiniServ'
+    [[ "$v" =~ $re ]] && suggest "Webmin - 1.920 oncesi RCE kontrolu (searchsploit webmin)"
+    re='WordPress'
+    [[ "$v" =~ $re ]] && suggest "WordPress: wpscan --url <adres> --enumerate ap,at,cb,u"
+}
+
+mod_smb() {
+    local pnum="$1" ver="$2" out
+    good "SMB tespit edildi: ${pnum}/tcp"
+    suggest "smbclient -L //$IP -N                     (null session / share listesi)"
+    suggest "enum4linux -a $IP                         (kapsamli SMB enum)"
+    suggest "nmap --script smb-vuln-ms17-010 -p ${pnum} $IP   (EternalBlue kontrolu)"
+    if grep -q "Message signing enabled but not required" "${NMAPFILES[@]}" 2>/dev/null; then
+        finding "SMB mesaj imzalama zorunlu degil - NTLM relay (ntlmrelayx) icin uygun"
+    fi
+    [ -n "$ver" ] && suggest "searchsploit \"$ver\""
+    if command -v smbclient >/dev/null; then
+        if ask_enum "SMB null session testi yapilsin mi? (smbclient -L //$IP -N)"; then
+            out=$(timeout 20 smbclient -L "//$IP" -N 2>&1)
+            if echo "$out" | grep -qiE 'ACCESS_DENIED|LOGON_FAILURE|NT_STATUS|denied'; then
+                info "  null session KAPALI"
+            else
+                finding "SMB null session ACIK - share listesi alindi:"
+                echo "$out" | grep -vE '^\s*$' | head -20 | sed 's/^/    /'
+            fi
+        fi
+    else
+        warn "smbclient kurulu degil, null session testi atlandi"
+    fi
+}
+
+mod_http() {
+    local pnum="$1" proto="$2" svc="$3" ver="$4"
+    local scheme="http" hdrs server title robots out
+    case "$pnum" in 443|8443) scheme="https" ;; esac
+    [ "$svc" = "https" ] && scheme="https"
+    local url="${scheme}://${IP}:${pnum}"
+    good "Web servisi: $url"
+    case "$pnum" in
+        5985|5986|47001)
+            suggest "evil-winrm -i $IP -u <kullanici> -p <sifre>   (gecerli cred varsa)"
+            ;;
+        9200)
+            suggest "curl -s $url/_cluster/health | jq    (Elasticsearch yetkisiz erisim kontrolu)"
+            ;;
+    esac
+    suggest "whatweb $url"
+    suggest "nikto -h $url"
+    local WL="/usr/share/wordlists/dirb/common.txt"
+    if [ -f "$WL" ]; then
+        suggest "gobuster dir -u $url -w $WL"
+    else
+        suggest "gobuster dir -u $url -w <wordlist>"
+    fi
+    [ -n "$ver" ] && suggest "searchsploit \"$ver\""
+    if command -v curl >/dev/null && ask_enum "HTTP enum yapilsin mi? (baslik/title/robots.txt: $url)"; then
+        code=$(timeout 10 curl -sS -m 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+        [ -n "$code" ] && info "  HTTP $code"
+        hdrs=$(timeout 10 curl -sSI -m 10 "$url" 2>&1)
+        server=$(echo "$hdrs" | grep -i '^server:' | head -1 | tr -d '\r')
+        [ -n "$server" ] && info "  $server"
+        title=$(timeout 10 curl -sSf -m 10 "$url" 2>/dev/null | grep -oiP '(?<=<title>)[^<]{1,80}' | head -1)
+        [ -n "$title" ] && info "  Title: $title"
+        [ -n "$server" ] && version_hints "$server"
+        robots=$(timeout 10 curl -sSf -m 10 "$url/robots.txt" 2>/dev/null | grep -vE '^(#|$)' | head -10)
+        if [ -n "$robots" ]; then
+            info "  robots.txt:"
+            echo "$robots" | sed 's/^/    /'
+            echo "$robots" | grep -qiE 'admin|backup|internal' && finding "robots.txt icinde ilgi cekici yollar var (admin/backup/internal)"
+        fi
+    fi
+}
+
+mod_ftp() {
+    local pnum="$1" ver="$2" out
+    good "FTP: ${pnum}/tcp"
+    suggest "Anonymous login + yazma hakki kontrolu (kucuk bir dosya PUT dene)"
+    [ -n "$ver" ] && suggest "searchsploit \"$ver\""
+    if grep -q "Anonymous FTP login allowed" "${NMAPFILES[@]}" 2>/dev/null; then
+        finding "FTP anonymous login ACIK (nmap ftp-anon bulgusu)"
+    elif command -v curl >/dev/null; then
+        if ask_enum "FTP anonymous login testi yapilsin mi?"; then
+            out=$(timeout 10 curl -sS -m 10 --list-only "ftp://${IP}:${pnum}/" --user "anonymous:anonymous@test" 2>&1)
+            if echo "$out" | grep -qiE '530|login|failed|denied'; then
+                info "  anonymous login KAPALI"
+            else
+                finding "FTP anonymous login ACIK"
+                echo "$out" | head -10 | sed 's/^/    /'
+            fi
+        fi
+    fi
+}
+
+mod_snmp() {
+    local pnum="$1" out
+    good "SNMP: ${pnum}/udp"
+    suggest "snmpwalk -v2c -c public $IP system"
+    suggest "snmp-check $IP (varsa)"
+    if command -v snmpwalk >/dev/null; then
+        if ask_enum "SNMP 'public' community testi yapilsin mi?"; then
+            out=$(timeout 15 snmpwalk -v2c -t 5 -r 1 -c public "$IP" system 2>&1)
+            if echo "$out" | grep -qiE 'timeout|no response|unknown|invalid'; then
+                info "  'public' community calismadi"
+            else
+                finding "SNMP 'public' community ACIK:"
+                echo "$out" | head -15 | sed 's/^/    /'
+            fi
+        fi
+    fi
+}
+
+mod_redis() {
+    local pnum="$1" out
+    good "Redis: ${pnum}/tcp"
+    suggest "redis-cli -h $IP INFO server          (auth kontrolu)"
+    suggest "Yetkisiz erisim varsa: config set dir RCE senaryosu (searchsploit redis)"
+    if command -v redis-cli >/dev/null; then
+        if ask_enum "Redis yetkisiz erisim testi yapilsin mi?"; then
+            out=$(timeout 10 redis-cli -h "$IP" -p "$pnum" INFO server 2>&1)
+            if echo "$out" | grep -qiE 'NOAUTH|error|connection refused'; then
+                info "  auth gerekiyor / erisilemedi"
+            elif [ -n "$out" ]; then
+                finding "Redis yetkisiz erisim ACIK:"
+                echo "$out" | grep -E 'redis_version|os:|tcp_port' | head -5 | sed 's/^/    /'
+            fi
+        fi
+    fi
+}
+
+mod_generic_db() {
+    local pnum="$1" svc="$2" ver="$3"
+    good "$svc: ${pnum}/tcp"
+    case "$svc" in
+        mysql*|mariadb*)   suggest "varsayilan cred denemesi: mysql -h $IP -u root (bos sifre)" ;;
+        ms-sql*|mssql*)    suggest "varsayilan cred denemesi: sa / bos - msf mssql_login" ;;
+        mongodb*|mongod*)  suggest "mongosh mongodb://$IP:${pnum}   (yetkisiz erisim kontrolu)" ;;
+        cassandra*)        suggest "cqlsh $IP ${pnum} -u cassandra -p cassandra" ;;
+    esac
+    [ -n "$ver" ] && suggest "searchsploit \"$ver\""
+}
+
+analyze_service() {
+    local pnum="$1" proto="$2" svc="$3" ver="$4"
+    echo -e "\n${BOLD}>>> ${pnum}/${proto}  ${svc}  ${ver}${NC}"
+    [ -n "$ver" ] && version_hints "$ver"
+    case "$svc" in
+        *microsoft-ds*|*netbios-ssn*|*smb*)   mod_smb "$pnum" "$ver" ;;
+        ftp|ftp-data|ftps)                    mod_ftp "$pnum" "$ver" ;;
+        ssh)                                  good "SSH: ${pnum}/tcp" ;;
+        http|https|http-alt|http-proxy|httpapi*|*www*|ssl|wsmans)
+                                              mod_http "$pnum" "$proto" "$svc" "$ver" ;;
+        snmp*|snmptrap)                       mod_snmp "$pnum" ;;
+        redis)                                mod_redis "$pnum" ;;
+        mysql*|mariadb*|ms-sql*|mssql*|mongodb*|mongod*|cassandra*)
+                                              mod_generic_db "$pnum" "$svc" "$ver" ;;
+        ms-wbt-server|rdp)
+            good "RDP: ${pnum}/tcp"
+            suggest "hydra -L users.txt -P pass.txt rdp://$IP (cred varsa)"
+            info "  NLA acik olabilir - cred olmadan enum sinirli" ;;
+        ldap*|ldaps*)
+            good "LDAP: ${pnum}/tcp"
+            suggest "ldapsearch -x -H ldap://$IP -b \"\" -s base (anonymous bind kontrolu)"
+            suggest "AD ortaminda: windapsearch / bloodhound" ;;
+        smtp*|submission)
+            good "SMTP: ${pnum}/tcp"
+            suggest "smtp-user-enum -M VRFY -U users.txt -t $IP" ;;
+        domain)
+            good "DNS: ${pnum}/tcp"
+            suggest "dig axfr @$IP <zone>              (zone transfer denemesi)"
+            suggest "dig @$IP CHAOS TXT version.bind   (surum sizma)" ;;
+        kerberos*|kpasswd*)
+            good "Kerberos: ${pnum}/tcp"
+            suggest "kerbrute userenum -d <domain> --dc $IP users.txt"
+            suggest "AS-REP roast: GetNPUsers.py (impacket)" ;;
+        telnet)
+            good "Telnet: ${pnum}/tcp"
+            warn "Telnet sifresiz protokol - sniffing firsati" ;;
+        vnc*|rfb)
+            good "VNC: ${pnum}/tcp"
+            suggest "vncviewer $IP::$pnum + auth bypass surum kontrolu" ;;
+        *nfs*|*mountd*|rpcbind)
+            good "NFS/RPC: ${pnum}/tcp"
+            suggest "showmount -e $IP   (export edilen dizinler)"
+            suggest "Mount edilebiliyorsa: mount -t nfs $IP:/dizin /mnt/x" ;;
+        memcache*)
+            good "Memcached: ${pnum}/tcp"
+            suggest "(printf 'stats\r\n'; sleep 1) | nc $IP ${pnum}  (yetkisiz erisim)" ;;
+        java-rmi*|*rmi*|registry)
+            good "Java RMI: ${pnum}/tcp"
+            suggest "msfconsole: auxiliary/scanner/misc/java_rmi" ;;
+        *)
+            info "${pnum}/${proto} ${svc} ${ver}"
+            suggest "searchsploit \"${svc}\" (surume gore)" ;;
+    esac
+}
+
+echo
+echo -e "${BOLD}================ AKILLI ANALIZ ================${NC}"
+OSHINT=$(grep -h -oP 'Service Info: OS: \K[^;]+' "${NMAPFILES[@]}" 2>/dev/null | head -1)
+[ -z "$OSHINT" ] && OSHINT=$(grep -h -oP 'Aggressive OS guesses: \K[^|]+' "${NMAPFILES[@]}" 2>/dev/null | head -1)
+[ -n "$OSHINT" ] && info "OS ipucu: $OSHINT"
+
+while IFS='|' read -r pport pstate psvc pver; do
+    [ "$pstate" = "open" ] || continue
+    pnum="${pport%%/*}"; pproto="${pport##*/}"
+    analyze_service "$pnum" "$pproto" "$psvc" "$pver"
+done < <(emit_ports "${NMAPFILES[@]}" | sort -u)
+
+while IFS= read -r line; do
+    finding "nmap script bulgusu: $line"
+done < <(grep -hE 'VULNERABLE|Anonymous FTP login allowed' "${NMAPFILES[@]}" 2>/dev/null | sed 's/^[[:space:]]*|[ _-]*//g' | grep -v '^$' | sort -u)
+
+if [ -n "$OSHINT" ] && [[ "$OSHINT" =~ Windows ]]; then
+    suggest "Windows hedef: crackmapexec smb $IP --shares (cred varsa), MS17-010 unutma"
+fi
+
+# ---------------- 5. asama: onceki tarama ile karsilastirma ----------------
+
+if [ "$DO_DIFF" -eq 1 ]; then
+    PREV=$(ls -t "$OUTDIR/${IP}_"*.nmap 2>/dev/null | grep -v "$STAMP" | head -1)
+    if [ -n "$PREV" ]; then
+        NOWF="$TMPD/now.tsv"; PREVF="$TMPD/prev.tsv"
+        awk -F'[ /]+' '$2=="tcp" && $3=="open" {print $1, $4}' "$OUTNMAP" | sort -k1,1 > "$NOWF"
+        awk -F'[ /]+' '$2=="tcp" && $3=="open" {print $1, $4}' "$PREV" | sort -k1,1 > "$PREVF"
+        ADDED=$(comm -23 <(awk '{print $1}' "$NOWF") <(awk '{print $1}' "$PREVF"))
+        REMOVED=$(comm -13 <(awk '{print $1}' "$NOWF") <(awk '{print $1}' "$PREVF"))
+        CHANGED=$(join "$NOWF" "$PREVF" 2>/dev/null | awk '$2!=$3 {print $1": "$3" -> "$2}')
+        if [ -n "$ADDED$REMOVED$CHANGED" ]; then
+            echo
+            echo -e "${BOLD}=========== TARAMA KARSILASTIRMASI ===========${NC}"
+            info "Onceki tarama: $PREV"
+            [ -n "$ADDED" ]   && good  "YENI acilan portlar: $(echo $ADDED | tr '\n' ' ')"
+            [ -n "$REMOVED" ] && warn  "KAPANAN portlar: $(echo $REMOVED | tr '\n' ' ')"
+            [ -n "$CHANGED" ] && info  "Servis degisiklikleri:" && echo "$CHANGED" | sed 's/^/    /'
+        fi
+        {
+            echo "onceki_tarama: $PREV"
+            [ -n "$ADDED" ]   && echo "yeni_portlar: $(echo $ADDED | tr '\n' ' ')"
+            [ -n "$REMOVED" ] && echo "kapanan_portlar: $(echo $REMOVED | tr '\n' ' ')"
+            [ -n "$CHANGED" ] && echo "servis_degisiklikleri:" && echo "$CHANGED"
+        } >> "$DIFFFILE"
+    fi
+fi
+
+# ---------------- 6. asama: JSON cikti ----------------
+
+if [ "$DO_JSON" -eq 1 ]; then
+    XMLS=("$OUTXML")
+    [ -f "$UDPXML" ] && XMLS+=("$UDPXML")
+    if python3 - "$OUTJSON" "$IP" "$PROFILE" "$STAMP" "$FINDFILE" "$SUGGFILE" "$DIFFFILE" "${XMLS[@]}" <<'PY'
+import sys, json
+import xml.etree.ElementTree as ET
+
+out_json, target, profile, stamp, ff, sf, df = sys.argv[1:8]
+xmls = [a for a in sys.argv[8:] if a]
+
+def lines(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            return [l.rstrip() for l in fh if l.strip()]
+    except OSError:
+        return []
+
+ports, os_hint = [], ""
+for xf in xmls:
+    try:
+        root = ET.parse(xf).getroot()
+    except (ET.ParseError, OSError):
+        continue
+    for host in root.iter('host'):
+        for o in host.iter('osmatch'):
+            os_hint = os_hint or o.get('name', '')
+        for p in host.iter('port'):
+            st = p.find('state')
+            if st is None or st.get('state') != 'open':
+                continue
+            sv = p.find('service')
+            entry = {
+                'port': int(p.get('portid')),
+                'proto': p.get('protocol'),
+                'service': (sv.get('name', '') if sv is not None else ''),
+                'version': '',
+                'scripts': {},
+            }
+            if sv is not None:
+                entry['version'] = ' '.join(filter(None, [
+                    sv.get('product'), sv.get('version'), sv.get('extrainfo')])).strip()
+            for s in p.iter('script'):
+                entry['scripts'][s.get('id', '')] = (s.text or '').strip()[:400]
+            ports.append(entry)
+
+data = {
+    'tool': 'husearch', 'tool_version': '2.1',
+    'target': target, 'profile': profile, 'timestamp': stamp,
+    'os_hint': os_hint,
+    'ports': sorted(ports, key=lambda e: (e['proto'], e['port'])),
+    'findings': lines(ff),
+    'suggestions': lines(sf),
+    'diff': lines(df),
+}
+with open(out_json, 'w', encoding='utf-8') as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+PY
+    then
+        good "JSON kaydedildi: $OUTJSON"
+    else
+        warn "JSON uretilemedi (nmap XML parse hatasi?)"
+    fi
+fi
+
+# ---------------- 7. asama: AI pentester analizi ----------------
+
+AIOUT="$BASE.ai.md"
+if [ "$DO_AI" -eq 1 ]; then  # AIOUT yukarida her durumda atanir (set -u guvenligi)
+    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        info "AI analizi atlandi (ANTHROPIC_API_KEY tanimli degil)."
+        info "  Etkinlestirmek icin:  export ANTHROPIC_API_KEY=sk-ant-..."
+    elif ! command -v curl >/dev/null; then
+        warn "AI analizi atlandi (curl bulunamadi)"
+    else
+        AI_MODEL="${HUSEARCH_MODEL:-claude-opus-4-8}"
+        AI_EFFORT="${HUSEARCH_EFFORT:-medium}"
+        AIREQ="$TMPD/ai_req.json"
+        AIRESP="$TMPD/ai_resp.json"
+        AIXMLS=("$OUTXML")
+        [ -f "$UDPXML" ] && AIXMLS+=("$UDPXML")
+        echo
+        echo -e "${BOLD}============== AI PENTESTER ANALIZI ==============${NC}"
+        info "model: $AI_MODEL (effort: $AI_EFFORT) - bulgular Claude'a gonderiliyor..."
+        if python3 -I - "$AIREQ" "$AI_MODEL" "$AI_EFFORT" "$IP" "$PROFILE" "$FINDFILE" "$SUGGFILE" "$DIFFFILE" "${AIXMLS[@]}" <<'PY'
+import sys, json
+import xml.etree.ElementTree as ET
+
+req_path, model, effort, target, profile, ff, sf, df = sys.argv[1:9]
+xmls = [a for a in sys.argv[9:] if a]
+
+def lines(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            return [l.rstrip() for l in fh if l.strip()]
+    except OSError:
+        return []
+
+ports, os_hint = [], ""
+for xf in xmls:
+    try:
+        root = ET.parse(xf).getroot()
+    except (ET.ParseError, OSError):
+        continue
+    for host in root.iter('host'):
+        for o in host.iter('osmatch'):
+            os_hint = os_hint or o.get('name', '')
+        for p in host.iter('port'):
+            st = p.find('state')
+            if st is None or st.get('state') != 'open':
+                continue
+            sv = p.find('service')
+            svc = sv.get('name', '') if sv is not None else ''
+            ver = ''
+            if sv is not None:
+                ver = ' '.join(filter(None, [
+                    sv.get('product'), sv.get('version'), sv.get('extrainfo')])).strip()
+            scripts = []
+            for s in p.iter('script'):
+                txt = (s.text or '').strip().replace('\n', ' ')
+                if txt:
+                    scripts.append("%s: %s" % (s.get('id', ''), txt[:300]))
+            ports.append((int(p.get('portid')), p.get('protocol'), svc, ver, scripts))
+
+ports.sort(key=lambda e: (e[1], e[0]))
+
+buf = ["Hedef: %s" % target, "Profil: %s" % profile]
+if os_hint:
+    buf.append("OS ipucu: %s" % os_hint)
+buf.append("")
+buf.append("== Acik portlar / servisler ==")
+for pn, proto, svc, ver, scripts in ports:
+    buf.append(("- %d/%s  %s  %s" % (pn, proto, svc, ver)).rstrip())
+    for sc in scripts:
+        buf.append("    [script] %s" % sc)
+for title, path in (("husearch bulgulari", ff), ("husearch onerileri", sf),
+                    ("onceki tarama farki", df)):
+    rows = lines(path)
+    if rows:
+        buf.append("")
+        buf.append("== %s ==" % title)
+        buf += ["- %s" % r for r in rows]
+report = "\n".join(buf)
+
+system = (
+    "Sen kidemli bir sizma testi (pentest) uzmanisin, OSCP/OSEP seviyesinde. "
+    "Sana yetkili bir pentest kapsamindaki bir hedefin husearch (rustscan+nmap) kesif "
+    "ciktisi verilecek. Gorevin bu veriyi bir mentor gibi yorumlamak. Yanitin TAMAMEN "
+    "TURKCE ve markdown olsun; kisa, net, aksiyon odakli. Su basliklari kullan:\n"
+    "## Ozet\n(1-2 cumle hedefin genel gorunumu)\n"
+    "## Bilinen zafiyetler\n(gordugun servis/versiyonlara dair olasi CVE'ler; her biri icin "
+    "[KESIN]/[OLASI]/[DUSUK] guven etiketi ve tek cumle gerekce. Versiyon bilgisi yoksa bunu "
+    "acikca soyle, CVE uydurma.)\n"
+    "## Oncelikli saldiri yolu\n(numarali: once ne, sonra ne)\n"
+    "## Servis bazli komutlar\n(kopyala-calistir komutlar; hedef yerine gercek IP'yi koy)\n"
+    "Kurallar: yalnizca verideki kanitlara dayan, port/servis uydurma; yanlis pozitif riski "
+    "varsa belirt; yikici/DoS teknikleri onerme. Yanit sadece yetkili test icindir."
+)
+user = ("husearch kesif ciktisi:\n\n```\n" + report +
+        "\n```\n\nYukaridaki ciktiya gore analizini yap.")
+
+body = {
+    "model": model,
+    "max_tokens": 4000,
+    "output_config": {"effort": effort},
+    "system": system,
+    "messages": [{"role": "user", "content": user}],
+}
+with open(req_path, 'w', encoding='utf-8') as fh:
+    json.dump(body, fh, ensure_ascii=False)
+PY
+        then
+            AIHTTP=$(curl -sS -m 120 -o "$AIRESP" -w '%{http_code}' \
+                https://api.anthropic.com/v1/messages \
+                -H "x-api-key: $ANTHROPIC_API_KEY" \
+                -H "anthropic-version: 2023-06-01" \
+                -H "content-type: application/json" \
+                --data-binary @"$AIREQ" 2>/dev/null)
+            if [ "$AIHTTP" = "200" ]; then
+                echo
+                if python3 -I - "$AIRESP" "$AIOUT" <<'PY'
+import sys, json
+resp_path, out_path = sys.argv[1:3]
+try:
+    with open(resp_path, encoding='utf-8', errors='replace') as fh:
+        data = json.load(fh)
+except Exception as e:
+    sys.stderr.write("yanit JSON degil: %s\n" % e); sys.exit(1)
+if isinstance(data, dict) and data.get('type') == 'error':
+    sys.stderr.write((data.get('error') or {}).get('message', 'bilinmeyen API hatasi') + "\n")
+    sys.exit(1)
+parts = [b.get('text', '') for b in data.get('content', []) if b.get('type') == 'text']
+text = "\n".join(p for p in parts if p).strip()
+if not text:
+    sys.stderr.write("bos yanit (stop_reason=%s)\n" % data.get('stop_reason')); sys.exit(1)
+with open(out_path, 'w', encoding='utf-8') as fh:
+    fh.write(text + "\n")
+sys.stdout.write(text + "\n")
+PY
+                then
+                    good "AI analizi kaydedildi: $AIOUT"
+                else
+                    warn "AI yaniti ayiklanamadi (ham yanit: $AIRESP)"
+                fi
+            else
+                err "AI API hatasi (HTTP ${AIHTTP:-?})"
+                [ -s "$AIRESP" ] && echo "    $(head -c 400 "$AIRESP" | tr -d '\n')"
+            fi
+        else
+            warn "AI istegi hazirlanamadi (python)"
+        fi
+    fi
+fi
+
+# ---------------- 8. asama: ozet ----------------
+
+NF=$(wc -l < "$FINDFILE" | tr -d ' ')
+NS=$(wc -l < "$SUGGFILE" | tr -d ' ')
+echo
+echo -e "${BOLD}================ OZET ================${NC}"
+if [ "$NF" -gt 0 ]; then
+    warn "Bulgu sayisi: $NF"
+    sed 's/^/  /' "$FINDFILE"
+else
+    info "Kritik bulgu yok"
+fi
+info "Oneri sayisi: $NS"
+info "Sure: $((SECONDS/60)) dk $((SECONDS%60)) sn"
+info "Dosyalar: $OUTNMAP"
+[ "$DO_JSON" -eq 1 ] && info "         $OUTJSON"
+[ -f "$UDPNMAP" ] && info "         $UDPNMAP"
+[ -f "$AIOUT" ] && info "         $AIOUT"
+
+if [ "$RC" -ne 0 ]; then
+    warn "nmap hata kodu ile cikti: $RC (root degilsen -sS yerine connect scan dener, sudo ile calistir)"
+fi
+exit $RC
